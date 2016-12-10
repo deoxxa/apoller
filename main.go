@@ -3,15 +3,20 @@ package main
 import (
 	"crypto/tls"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kolo/xmlrpc"
+	"github.com/robertkrimen/otto"
 	"github.com/thoj/go-ircevent"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/fsnotify.v1"
 )
 
 var (
@@ -28,20 +33,22 @@ var (
 	filterYears   = app.Flag("filter_years", "Filter downloads to releases from these years").Ints()
 	filterTags    = app.Flag("filter_tags", "Filter downloads to releases with these tags").Strings()
 	filterFormats = app.Flag("filter_formats", "Filter downloads to releases with these formats").Strings()
+	filterScript  = app.Flag("filter_script", "Filter downloads according to a JavaScript function").ExistingFile()
+	liveReload    = app.Flag("live_reload", "Reload filter script when it changes").Bool()
 )
 
 type announce struct {
-	time   time.Time
-	name   string
-	format string
-	page   string
-	url    string
-	artist string
-	title  string
-	year   int
-	kind   string
-	tags   []string
-	id     int
+	Time   time.Time
+	Name   string
+	Format string
+	Page   string
+	URL    string
+	Artist string
+	Title  string
+	Year   int
+	Kind   string
+	Tags   []string
+	ID     int
 }
 
 var announceRegexp = regexp.MustCompile("^\x02TORRENT:\x02 \x0303(.+?)\x03 - \x0310(.+?)\x03\x03 - \x0312(.+?)\x03 - \x0304(.+?)\x03 / \x0304(.+?)\x03$")
@@ -71,21 +78,90 @@ func parseAnnounce(s string) (*announce, error) {
 	}
 
 	return &announce{
-		time:   time.Now(),
-		name:   name,
-		format: format,
-		page:   page,
-		url:    url,
-		artist: artist,
-		title:  title,
-		year:   int(year),
-		kind:   kind,
-		tags:   tags,
+		Time:   time.Now(),
+		Name:   name,
+		Format: format,
+		Page:   page,
+		URL:    url,
+		Artist: artist,
+		Title:  title,
+		Year:   int(year),
+		Kind:   kind,
+		Tags:   tags,
 	}, nil
 }
 
 func main() {
 	kingpin.MustParse(app.Parse(os.Args[1:]))
+
+	var vm *otto.Otto
+	var vmFilter *otto.Value
+	var vmLock sync.Mutex
+	if filterScript != nil && *filterScript != "" {
+		vm = otto.New()
+
+		loadFilterScript := func() error {
+			vmLock.Lock()
+			defer vmLock.Unlock()
+
+			fmt.Printf("loading filter script: %q\n", *filterScript)
+
+			d, err := ioutil.ReadFile(*filterScript)
+			if err != nil {
+				return err
+			}
+
+			s, err := vm.Compile(path.Base(*filterScript), string(d))
+			if err != nil {
+				return err
+			}
+
+			if _, err := vm.Run(s); err != nil {
+				return err
+			}
+
+			fn, err := vm.Get("filter")
+			if err != nil {
+				return err
+			}
+
+			if !fn.IsFunction() {
+				return fmt.Errorf("script must define a `filter' function")
+			}
+
+			vmFilter = &fn
+
+			fmt.Printf("filter script loaded\n")
+
+			return nil
+		}
+
+		if err := loadFilterScript(); err != nil {
+			panic(err)
+		}
+
+		if *liveReload {
+			w, err := fsnotify.NewWatcher()
+			if err != nil {
+				panic(err)
+			}
+
+			if err := w.Add(*filterScript); err != nil {
+				panic(err)
+			}
+
+			go func() {
+				for ev := range w.Events {
+					switch ev.Op {
+					case fsnotify.Write, fsnotify.Create, fsnotify.Rename:
+						if err := loadFilterScript(); err != nil {
+							fmt.Printf("error loading filter script: %s\n", err.Error())
+						}
+					}
+				}
+			}()
+		}
+	}
 
 	r, err := xmlrpc.NewClient(*rtorrentURL, nil)
 	if err != nil {
@@ -117,7 +193,7 @@ func main() {
 				foundYear := false
 
 				for _, year := range *filterYears {
-					if a.year == year {
+					if a.Year == year {
 						foundYear = true
 						break
 					}
@@ -133,7 +209,7 @@ func main() {
 
 			outer:
 				for _, tag := range *filterTags {
-					for _, t := range a.tags {
+					for _, t := range a.Tags {
 						if t == tag {
 							foundTag = true
 							break outer
@@ -150,7 +226,7 @@ func main() {
 				foundFormat := false
 
 				for _, format := range *filterFormats {
-					if a.format == format {
+					if a.Format == format {
 						foundFormat = true
 						break
 					}
@@ -161,7 +237,27 @@ func main() {
 				}
 			}
 
-			downloadURL := a.url + fmt.Sprintf("&authkey=%s&torrent_pass=%s", *authkey, *passkey)
+			if vmFilter != nil {
+				vmLock.Lock()
+				defer vmLock.Unlock()
+
+				v, err := vmFilter.Call(otto.UndefinedValue(), a)
+				if err != nil {
+					fmt.Printf("failed to run filter: %s\n", err.Error())
+					return
+				}
+
+				b, err := v.ToBoolean()
+				if err != nil {
+					fmt.Printf("failed to interpret filter value as boolean: %s\n", err.Error())
+				}
+
+				if !b {
+					return
+				}
+			}
+
+			downloadURL := a.URL + fmt.Sprintf("&authkey=%s&torrent_pass=%s", *authkey, *passkey)
 
 			var rc int
 			if err := r.Call("load_start", []string{downloadURL}, &rc); err != nil {
