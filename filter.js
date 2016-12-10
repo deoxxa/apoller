@@ -1,8 +1,12 @@
-var tags = ['ambient', 'vaporwave', 'glitch'];
+var tags = [
+  'ambient',
+  'vaporwave',
+  'glitch',
+  'synthpop',
+  'synthwave',
+];
 
 function filter(a) {
-  console.log('tags', a.Tags.join(', '));
-
   if (a.Year >= 2016) {
     console.log('[+]', 'year=' + a.Year, a.Name);
     return true;
@@ -15,7 +19,7 @@ function filter(a) {
     }
   }
 
-  console.log('[-]', a.Name);
+  console.log('[-]', a.Name, ':', a.Year, ':', a.Tags.join(', '));
 
   return false;
 }
